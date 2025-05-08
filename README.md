@@ -89,12 +89,13 @@ flowchart LR
 
 ---
 
-## 🔧 4. Installation
+## 🔧 4. Installation & Start
 
 ```bash
 git clone https://github.com/MaliosDark/voluminoucious-bot.git
 cd voluminoucious-bot
 npm install
+npm start 
 ```
 
 ---
