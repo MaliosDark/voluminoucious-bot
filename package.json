@@ -1,6 +1,6 @@
 {
   "name": "voluminoucious",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "description": "Volumen bot With multi wallet creation for telegram",
   "main": "bot.js",
   "scripts": {
@@ -10,6 +10,7 @@
   "license": "MIT",
   "dependencies": {
     "@solana/web3.js": "^1.98.2",
+    "chalk": "^5.4.1",
     "dotenv": "^16.5.0",
     "node-telegram-bot-api": "^0.66.0",
     "solana-swap": "^1.1.6"
