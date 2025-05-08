@@ -14,6 +14,7 @@
   <img src="https://img.shields.io/badge/node--fetch-v3.4.0-lightblue?style=flat-square"/>
   <img src="https://img.shields.io/badge/Encrypted-AES--256--GCM-orange?style=flat-square"/>
   <img src="https://img.shields.io/badge/Data%20Feed-CoinGecko-yellowgreen?style=flat-square"/>
+  <img src="https://img.shields.io/badge/AdminOverride-Yes-green?style=flat-square"/>
   <img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square"/>
   <img src="https://img.shields.io/badge/Status-Beta-yellow?style=flat-square"/>
 </p>
@@ -26,198 +27,224 @@
 
 ## 🎯 1. Introduction
 
-**Voluminoucious Bot** is a Telegram-based trading assistant designed for the Solana blockchain. It offers:
+Voluminoucious Bot is an **advanced volume-boosting** assistant for any SPL token on Solana.
+It offers:
 
-* **Automated volume trading** cycles on any SPL token.
-* **Management of multiple wallets** per user: one **main** and configurable **secondary** wallets.
-* **Deposit splitting**, execution of randomized buy/sell cycles, and stopping at a safe threshold.
-* **Platform fee reservation**: 38% of the deposit is reserved for platform fees.
-* **Secure state persistence** using AES-GCM–encrypted storage, ensuring session continuity.
-* **Live token metrics** fetched from CoinGecko, including price, market cap, volume, supply, rank, and percentage changes.
-* **Interactive Telegram panel** with actions to:
-
-  * Start/Reset session
-  * Add wallet
-  * Set token mint
-  * Configure parameters
-  * Run/Stop volume trading
-  * Sell all tokens back to SOL
-  * Withdraw all SOL
+* **Per-chat sessions** (group or private), keyed by `chat.id`, isolating each user or chat.
+* **Admin override**: The admin (specified by `ADMIN_USERNAME` in `.env`) can bypass the 0.5 SOL minimum for testing.
+* **Interactive SPL-mint setup** with inline rate (“buys per minute”) selection.
+* **Auto-watcher** for deposits: once ≥ 0.5 SOL arrives (or immediately for admin), the bot starts boosting.
+* **Multiple secondary wallets**: configurable up to `maxWallets`.
+* **Randomized buy/sell cycles** on secondaries, leaving 40% as profit.
+* **Fee reservation**: 38% of deposit goes to a platform fee wallet; optional additional 1% per run.
+* **“Sell All”** and **“Withdraw”** actions with address-prompt flows.
+* **Live panel updates** every 30 s with profits, balances, stats.
+* **Console logging** (via `chalk`) for every major action.
+* **AES-GCM encrypted** session persistence.
+* **CoinGecko integration** for token metrics (price, cap, volume, supply, rank, changes).
 
 ---
 
 ## ⚙️ 2. Architecture & Data Flow
 
 ```mermaid
-flowchart LR
-  A[/start command/] --> B[Load or Init Session]
-  B --> C{Session exists?}
-  C -->|Yes| D[Build panel from file]
-  C -->|No| E[Create new panel]
-  D --> F[Show Telegram panel]
-  E --> F
-  F --> G[Button: Set Mint]
-  F --> H[Button: Add Wallet]
-  F --> I[Button: Configure]
-  F --> J[Button: Run Volume]
-  I --> K[Text: /setMaxWallets <n>]
-  K --> L[Text: /setBuyCycles <n>]
-  L --> M[Text: /setDelayMs <ms>]
-  J --> N[Loop through secondaries]
-  N --> O[Buy/Sell random split]
-  O --> N
-  N --> P[Stop at 40% SOL]
-  P --> Q[Transfer profit to main]
-  Q --> F
-  F --> R[Button: Stop Volume]
-  F --> S[Button: Sell All]
-  F --> T[Button: Withdraw Funds]
-  F --> U[Button: New Session → Reset + Reserve]
-  U --> E
+flowchart TD
+  Start[/User sends /start/] --> Load[Load or Init Session]
+  Load --> Check{Session Exists?}
+  Check -- Yes --> Reset[Reset awaiting mint]
+  Check -- No --> Init[Create new session]
+
+  Reset --> Welcome[Send welcome image and ask for SPL token mint]
+  Init --> Welcome
+
+  Welcome --> InputMint[User sends SPL token mint]
+  InputMint --> FetchInfo[Fetch token info from CoinGecko]
+  FetchInfo --> ShowInfo[Display token info]
+  ShowInfo --> AskRate[Prompt user to select buy rate]
+  AskRate --> SetRate[User selects buys per minute]
+  SetRate --> BuildPanel[Build control panel]
+  BuildPanel --> Watcher[Start deposit watcher]
+
+  Watcher --> CheckDeposit{Balance >= 0.5 SOL or admin?}
+  CheckDeposit -- No --> Wait[Wait for deposit]
+  CheckDeposit -- Yes --> Boost[Deposit detected, start volume run]
+
+  subgraph VolumeRun [Volume Run]
+    Boost --> Reserve[Send 38% to fee wallet]
+    Reserve --> OptionalFee[Send 1% fee]
+    OptionalFee --> Split[Split SOL to secondary wallets]
+    Split --> TradeLoop[Execute buy/sell cycles]
+    TradeLoop --> CheckWallet{SOL > 0.4 left?}
+    CheckWallet -- Yes --> Continue[Continue trading]
+    CheckWallet -- No --> Collect[Move SOL back to main wallet]
+    Collect --> SaveStats[Save final stats]
+  end
+
+  SaveStats --> Notify[Notify user: run completed]
+
+  subgraph Controls [User Actions]
+    Notify --> Stop[🛑 Stop: halt trading]
+    Notify --> SellAll[💸 Sell All: tokens to SOL]
+    Notify --> Withdraw[🏦 Withdraw: send SOL to user]
+    Notify --> ShowMain[🔍 Show Main wallet info]
+    Notify --> ShowStats[ℹ️ Stats: show summary]
+    Notify --> NewSession[🆕 New Session]
+  end
+
 ```
 
 ---
 
 ## 📦 3. Prerequisites
 
-* **Node.js v16+**
-* **npm**
-* A **Telegram bot token** (obtainable via [BotFather](https://t.me/BotFather))
-* A **Solana Devnet RPC URL**
-* A **32-byte base64 AES key** for encrypted storage
-* A **fee collection wallet** (public key) for platform fees
+* **Node.js v16+**, npm
+* **Telegram bot token** (from [BotFather](https://t.me/BotFather))
+* **ADMIN\_USERNAME** (your Telegram username)
+* **Solana RPC URL** (e.g. devnet)
+* **DB\_KEY**: 32-byte base64 for AES-GCM (e.g. `openssl rand -base64 32`)
+* **FEE\_WALLET**: Public key for platform fee collection
+
+`.env` example:
+
+```ini
+TELEGRAM_TOKEN=123456:ABC-DEF...
+ADMIN_USERNAME=YourTelegramUsername
+RPC_URL=https://api.devnet.solana.com
+DB_KEY=<32-byte-base64>
+FEE_WALLET=YourFeeWalletPubKey
+```
 
 ---
 
-## 🔧 4. Installation & Start
+## 🔧 4. Installation
 
 ```bash
 git clone https://github.com/MaliosDark/voluminoucious-bot.git
 cd voluminoucious-bot
 npm install
-npm start 
 ```
 
 ---
 
-## 📝 5. Configuration
+## 📝 5. Configuration & Environment
 
-Create a `.env` file in the project root:
-
-```ini
-TELEGRAM_TOKEN=<your-telegram-bot-token>
-RPC_URL=https://api.devnet.solana.com
-DB_KEY=<32-byte-base64-string>
-FEE_WALLET=<YourFeeWalletPublicKey>
-```
-
-* **`DB_KEY`**: Generate a secure 32-byte key, e.g., using `openssl rand -base64 32`.
-* **`FEE_WALLET`**: Public key where platform fees are collected.
+Create `.env` in the root with **all five** keys:
+`TELEGRAM_TOKEN`, `ADMIN_USERNAME`, `RPC_URL`, `DB_KEY`, `FEE_WALLET`.
 
 ---
 
-## 🔍 6. Session Structure
+## 🗺️ 6. Session Data Model
 
-Each user session is identified by their **Telegram username** or **user ID**. The session structure includes:
+Each `sessions[chatId]` contains:
 
 ```js
 {
-  main: Keypair,                    // Main wallet for deposits and consolidation
-  secondaries: Keypair[],           // Array of secondary wallets
-  tokenMint: string | null,         // SPL token address
-  panelMsg: { chat_id, message_id },// Telegram panel reference
+  main: Keypair,               // main SOL wallet
+  secondaries: Keypair[],      // SPL trading wallets
+  tokenMint: string | null,    // SPL token address
+  buyRate: number | null,      // buys per minute
+  withdrawTarget: string | null,
   stats: { initial, final, actions, start } | null,
   config: { maxWallets, buyCycles, delayMs },
-  geckoCache: { ts, info } | null   // Cached CoinGecko data
+  geckoCache: { ts, info } | null,
+  panelMsg: { chat_id, message_id } | null,
+  awaiting: 'mint'|'rate'|'withdraw'|null,
+  depositWatcher: Interval | null
 }
 ```
 
-* Sessions are **encrypted** using AES-GCM and stored in `.data-voluminousy/sessions.enc`.
+All fields are **AES-GCM** encrypted at rest.
 
 ---
 
-## 🗺️ 7. Commands & Buttons
+## 🗨️ 7. Commands & Buttons
 
-### 7.1 Telegram Buttons
+### 7.1 Inline Buttons
 
-| Button         | Description                                             |
-| -------------- | ------------------------------------------------------- |
-| 🆕 New Session | Reset session—collect all funds to fee wallet + reserve |
-| ➕ Add Wallet   | Create another secondary wallet                         |
-| 💳 Set Mint    | Prompt for SPL mint to trade                            |
-| ⚙️ Configure   | Shows text commands for advanced configuration          |
-| 🚀 Run Volume  | Begin buy/sell automation                               |
-| 🛑 Stop        | Immediately halt volume job                             |
-| 💸 Sell All    | Liquidate all SPL tokens → SOL, transfer to main        |
-| 🏦 Withdraw    | Transfer all SOL from main → user’s address             |
-| 🔍 Show Main   | Display main wallet balances                            |
-| ℹ️ Show Stats  | Show elapsed time, actions, profit                      |
+| Button               | Description                                                                        |
+| -------------------- | ---------------------------------------------------------------------------------- |
+| 🆕 **New**           | Reset session, collect all SOL → fee wallet & reserve; start over                  |
+| ➕ **Add**            | Create a new secondary wallet                                                      |
+| 💳 **Set Mint**      | Prompt for a new SPL token mint                                                    |
+| ⚙️ **Config**        | Show text commands: `/setMaxWallets`, `/setBuyCycles`, `/setDelayMs`               |
+| 🚀 **Run**           | Manually trigger a runVolume check (will still wait for deposit or admin override) |
+| 🛑 **Stop**          | Cancel the running volume job                                                      |
+| 🔍 **Main**          | Show main wallet address & balances                                                |
+| ℹ️ **Stats**         | Show elapsed time, trades count, profit                                            |
+| 💸 **Sell All**      | Swap all secondary tokens → SOL & transfer to main                                 |
+| 🏦 **Confirm WD**    | Immediately withdraw all SOL from main → `withdrawTarget`                          |
+| ✏️ **Withdraw Addr** | Prompt to set your withdrawal address                                              |
 
-### 7.2 Text Commands
+### 7.2 Slash-Commands
 
-```text
-/setMaxWallets <n>   — Limit of secondary wallets (1–50)
-/setBuyCycles <n>    — Number of randomized buy/sell cycles
-/setDelayMs <ms>     — Delay between swap transactions (ms)
+```txt
+/setMaxWallets <n>  — Set maximum secondary wallets (1–50)
+/setBuyCycles <n>   — Set number of buy/sell cycles per loop
+/setDelayMs <ms>    — Set delay (ms) between swaps
 ```
 
 ---
 
-## ⚙️ 8. Typical Workflow
+## ⚙️ 8. Example Workflows
 
-1. **/start**: Bot loads or initializes session and sends control panel.
-2. **Deposit**: Send ≥0.5 SOL to the **main** wallet address displayed via "Show Main".
-3. **Set Mint**: Use the button to specify the SPL token to trade.
-4. **Add Wallet**: Create up to `maxWallets` secondary wallets.
-5. **Run Volume**:
+### 8.1 Normal User
 
-   * Bot reserves 38% of the main wallet's balance to the fee wallet.
-   * Remaining SOL is split randomly among secondary wallets.
-   * Each secondary performs randomized buy/sell cycles.
-   * Trading halts when a wallet's SOL balance drops below 40%.
-   * Profits are consolidated back into the main wallet.
-6. **Stop**: Halt the trading process at any time.
-7. **Sell All**: Convert all SPL tokens back to SOL and transfer to the main wallet.
-8. **Withdraw**: Send all SOL from the main wallet to the user's Solana address.
+1. `/start` → Bot sends **welcome.png**, “Send SPL token mint”
+2. User sends `88dnPHaZDx…` → Bot fetches CoinGecko, asks “How fast?”
+3. User taps `20` → Bot shows panel, “Waiting for deposit of ≥ 0.5 SOL…”
+4. User sends 0.5 SOL → Deposit watcher triggers → “Deposit detected! Starting boost now.”
+5. Bot reserves 38% + 1%, splits remaining SOL across secondaries, begins randomized buys/sells.
+6. Panel auto-refresh every 30 s shows live balances & profit.
+7. User taps **Sell All** → All tokens liquidated & moved to main.
+8. User taps **Withdraw Addr**, sends their address → taps **Confirm WD** → SOL sent.
 
----
+### 8.2 Admin Testing
 
-## 🛠️ 9. Error Handling & Resilience
-
-* **Robust Error Handling**: All asynchronous operations are wrapped in try/catch blocks to log errors and notify users.
-* **Session Persistence**: Sessions are automatically saved after each state change.
-* **Periodic Panel Refresh**: The Telegram panel is updated every 60 seconds to reflect the latest status.
-* **Safe Session Reset**: The "New Session" action ensures all funds are collected to the fee wallet, preventing stranded assets.
+1. `/start` → same mint & rate flows.
+2. At rate selection, after panel appears, bot immediately says “Waiting for deposit…”
+3. Admin (your `ADMIN_USERNAME`) with zero SOL bypasses deposit minimum → bot starts instantly.
+4. All logs appear in console (colored via `chalk`).
 
 ---
 
-## 🔄 10. Fee Structure
+## 🛠️ 9. Fee & Profit Details
 
-* **Platform Reserve**: 38% of the main wallet's balance is transferred to the fee wallet at the start of a volume run.
-* **Optional Transaction Fee**: An additional 1% fee per transaction can be enabled by uncommenting the relevant lines in the code.
-
----
-
-## 📊 11. Token Metrics Integration
-
-The bot fetches real-time token data from CoinGecko, including:
-
-* **Price**: Current USD price.
-* **Market Cap**: Total market capitalization.
-* **Volume (24h)**: Trading volume over the past 24 hours.
-* **Circulating Supply**: Number of tokens in circulation.
-* **Total Supply**: Total number of tokens.
-* **Price Changes**: Percentage changes over 1h, 24h, and 7d.
-* **Rank**: Market cap rank.
-
-This information is displayed in the Telegram panel for user reference.
+* **Platform Reserve**: 38% of initial main balance goes to your `FEE_WALLET`.
+* **Optional 1% Run Fee**: Additional 1% fee per run (configurable in code).
+* **Profit**: The 40% leftover after each secondary drains triggers stop; profit consolidated back to main.
 
 ---
 
-## 🔐 12. Security Considerations
+## 📊 10. Token Metrics & Logging
 
-* **Encrypted Storage**: All session data is encrypted using AES-GCM.
-* **Key Management**: Private keys are securely managed within the application.
-* **User Authentication**: Actions are tied to the user's Telegram ID to prevent unauthorized access.
+* **CoinGecko** fetch every 5 minutes (cached) for:
 
+  * Price (USD)
+  * Market Cap
+  * 24 h Volume
+  * Circulating / Total Supply
+  * Price Δ% (1 h, 24 h, 7 d)
+  * Rank
+* **Console Logs** (via `chalk`):
 
+  * Session init / reset
+  * Reserve & fee transfers
+  * Split distribution
+  * Swap actions on each secondary
+  * Deposit detection & run start
+  * Sell All & Withdraw events
+
+---
+
+## 🔐 11. Security & Resilience
+
+* **AES-GCM** encryption of all session data.
+* **Admin override** only for your username.
+* **Try/Catch** around every async block to prevent crashes.
+* **Auto-save** after each state change ensures crash recovery.
+
+---
+
+## 📜 12. License
+
+Licensed under the [MIT License](LICENSE).
