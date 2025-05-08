@@ -1,9 +1,3 @@
-Thought for a second
-
-
-Here’s an expanded **README.md** that incorporates **every feature** of the latest `bot.js`—including **admin override**, **rate selection**, **auto-deposit watcher**, **console logging**, and **per-chat sessions**—and adds detailed example workflows, fee breakdown, and a bumped‐up Mermaid diagram.
-
----
 
 <p align="center">
   <img src="welcome.png" alt="Voluminoucious Bot Banner" width="700"/>
