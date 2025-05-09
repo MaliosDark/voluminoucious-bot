@@ -533,21 +533,35 @@ async function sellAll(chatId){
 
 const bot = new TelegramBot(BOT_TOKEN,{polling:true});
 
-// Step 1: /start → ask for mint
+// Step 1: /start → ask for mint and show initial empty panel
 bot.onText(/\/start/, async msg => {
-  const chatId = msg.chat.id;
-  await loadSessions();
-  if (!sessions[chatId]) {
-    await initSession(chatId);
-  } else {
-    sessions[chatId].awaiting = 'mint';
+    const chatId = msg.chat.id;
+    await loadSessions();
+    if (!sessions[chatId]) {
+      await initSession(chatId);
+    } else {
+      sessions[chatId].awaiting = 'mint';
+      saveSessions();
+    }
+  
+    // Build an empty (or “waiting for mint”) panel
+    const panel = await buildPanel(chatId);
+  
+    // Send it and capture the message_id
+    const m = await bot.sendPhoto(chatId, 'welcome.png', {
+      caption: panel.caption,
+      parse_mode: 'Markdown',
+      reply_markup: panel.reply_markup
+    });
+  
+    // Store for future edits
+    sessions[chatId].panelMsg = {
+      chat_id:    chatId,
+      message_id: m.message_id
+    };
     saveSessions();
-  }
-  await bot.sendPhoto(chatId, 'welcome.png', {
-    caption: '🚀 Welcome! Please send the *SPL token mint* to boost.',
-    parse_mode:'Markdown'
-  });
 });
+  
 
 // ─── Step 2: receive mint → show speed options (with multi-API fallback) ────
 
@@ -623,68 +637,158 @@ bot.on('message', async msg => {
 });
   
 
-// Step 3: rate button
-bot.on('callback_query', async q=>{
-  const chatId = q.message.chat.id;
-  const s = sessions[chatId];
-  if (!s) return;
-  if (q.data.startsWith('rate_') && s.awaiting==='rate') {
-    const n = parseInt(q.data.split('_')[1]);
-    s.buyRate    = n;
-    s.awaiting   = null;
-    saveSessions();
-    await bot.answerCallbackQuery(q.id, {text:`Set to ${n} buys/min`});
-    // now show panel
-    const panel = await buildPanel(chatId);
-    const m = await bot.sendPhoto(chatId,'welcome.png',{
-      caption: panel.caption,
-      parse_mode:'Markdown',
-      reply_markup: panel.reply_markup
-    });
-    s.panelMsg = { chat_id:chatId, message_id: m.message_id };
-    // start watching for deposit
-    s.depositWatcher = setInterval(async()=>{
-      const bal = await getBalance(s.main.publicKey);
-      // allow admin to start immediately even if bal < MIN_DEPOSIT
-      const isAdmin = q.from?.username === ADMIN_USERNAME;
-      if (bal >= MIN_DEPOSIT || isAdmin) {
-        clearInterval(s.depositWatcher);
-        s.depositWatcher = null;
+// Step 3: callback queries (rate selection, “New” confirmation, other actions)
+bot.on('callback_query', async q => {
+    const chatId = q.message.chat.id;
+    const s      = sessions[chatId];
+    if (!s) return;
+  
+    // 3.1 Handle buys-per-minute buttons
+    if (q.data.startsWith('rate_') && s.awaiting === 'rate') {
+      const n = parseInt(q.data.split('_')[1], 10);
+      s.buyRate  = n;
+      s.awaiting = null;
+      saveSessions();
+      await bot.answerCallbackQuery(q.id, { text: `Set to ${n} buys/min` });
+  
+      // send initial panel
+      const panel = await buildPanel(chatId);
+      const m     = await bot.sendPhoto(chatId, 'welcome.png', {
+        caption:    panel.caption,
+        parse_mode: 'Markdown',
+        reply_markup: panel.reply_markup
+      });
+      s.panelMsg = { chat_id: chatId, message_id: m.message_id };
+  
+      // start watching for deposit...
+      s.depositWatcher = setInterval(async () => {
+        const bal     = await getBalance(s.main.publicKey);
+        const isAdmin = q.from?.username === ADMIN_USERNAME;
+        if (bal >= MIN_DEPOSIT || isAdmin) {
+          clearInterval(s.depositWatcher);
+          s.depositWatcher = null;
+          saveSessions();
+          bot.sendMessage(chatId, '✅ Deposit detected! Starting boost now.');
+          runVolume(chatId);
+        }
+      }, 5000);
+  
+      bot.sendMessage(chatId, '⏳ Waiting for deposit of at least 0.5 SOL…');
+      saveSessions();
+      return;
+    }
+  
+    // 3.2 Intercept “New” and ask for confirmation
+    if (q.data === 'create') {
+      await bot.answerCallbackQuery(q.id);
+      return bot.sendMessage(chatId,
+        '⚠️ This will reset your session and you will lose all current wallets & deposits. Are you sure?',
+        {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '✅ Yes, reset', callback_data: 'confirm_create' },
+              { text: '❌ No, cancel',  callback_data: 'cancel_create' }
+            ]]
+          }
+        }
+      );
+    }
+  
+    // 3.3 User confirmed reset
+    if (q.data === 'confirm_create') {
+      await bot.answerCallbackQuery(q.id, { text: '🔄 Resetting session…' });
+      await initSession(chatId);
+  
+      const panel = await buildPanel(chatId);
+      const m     = await bot.sendPhoto(chatId, 'welcome.png', {
+        caption:    panel.caption,
+        parse_mode: 'Markdown',
+        reply_markup: panel.reply_markup
+      });
+      sessions[chatId].panelMsg = {
+        chat_id:    chatId,
+        message_id: m.message_id
+      };
+      saveSessions();
+      return;
+    }
+  
+    // 3.4 User canceled reset
+    if (q.data === 'cancel_create') {
+      await bot.answerCallbackQuery(q.id, { text: '❌ Reset cancelled.' });
+      return;
+    }
+  
+    // 3.5 All other callbacks
+    switch (q.data) {
+      case 'add':
+        {
+          const kp = Keypair.generate();
+          s.secondaries.push(kp);
+          saveSessions();
+        }
+        break;
+  
+      case 'setMint':
+        s.awaiting = 'mint';
         saveSessions();
-        bot.sendMessage(chatId,'✅ Deposit detected! Starting boost now.');
-        runVolume(chatId);
-      }
-    },5000);
-    // notify user that we're now watching for their deposit
-    bot.sendMessage(chatId, '⏳ Waiting for deposit of at least 0.5 SOL…');
-    saveSessions();
-    return;
-  }
-
-  // existing callbacks...
-  switch(q.data) {
-    case 'create':    await initSession(chatId); break;
-    case 'add':       { const kp=Keypair.generate(); sessions[chatId].secondaries.push(kp); saveSessions(); break; }
-    case 'setMint':   sessions[chatId].awaiting='mint'; saveSessions(); await bot.sendMessage(chatId,'📝 Send new mint:'); return;
-    case 'cfg':       await bot.sendMessage(chatId,'⚙️ /setMaxWallets /setBuyCycles /setDelayMs'); return;
-    case 'run':       return runVolume(chatId);
-    case 'stop':      return stopVolume(chatId);
-    case 'status':    return sendStats(chatId);
-    case 'showMain':  return showMain(chatId);
-    case 'sellAll':   return sellAll(chatId);
-    case 'setWithdraw': sessions[chatId].awaiting='withdraw'; saveSessions(); await bot.sendMessage(chatId,'📝 Send withdraw addr:'); return;
-    case 'confirmWithdraw': return confirmWithdraw(chatId);
-  }
-
-  // redraw
-  const panel = await buildPanel(chatId);
-  await bot.editMessageCaption(panel.caption,{
-    chat_id:panel.chat_id,
-    message_id:panel.message_id,
-    parse_mode:'Markdown',
-    reply_markup:panel.reply_markup
-  });
+        await bot.sendMessage(chatId, '📝 Send new mint:');
+        return;
+  
+      case 'cfg':
+        await bot.sendMessage(chatId, '⚙️ Use /setMaxWallets, /setBuyCycles or /setDelayMs');
+        return;
+  
+      case 'run':
+        return runVolume(chatId);
+  
+      case 'stop':
+        return stopVolume(chatId);
+  
+      case 'status':
+        return sendStats(chatId);
+  
+      case 'showMain':
+        return showMain(chatId);
+  
+      case 'sellAll':
+        return sellAll(chatId);
+  
+      case 'setWithdraw':
+        s.awaiting = 'withdraw';
+        saveSessions();
+        await bot.sendMessage(chatId, '📝 Send withdraw address:');
+        return;
+  
+      case 'confirmWithdraw':
+        return confirmWithdraw(chatId);
+  
+      // no default
+    }
+  
+    // 3.6 Redraw or send new panel if missing
+    const panel = await buildPanel(chatId);
+    const p     = s.panelMsg;
+    if (!p) {
+      // never sent a panel before → send new
+      const m = await bot.sendPhoto(chatId, 'welcome.png', {
+        caption:    panel.caption,
+        parse_mode: 'Markdown',
+        reply_markup: panel.reply_markup
+      });
+      s.panelMsg = { chat_id: chatId, message_id: m.message_id };
+      saveSessions();
+    } else {
+      // normal edit
+      await bot.editMessageCaption(panel.caption, {
+        chat_id:    p.chat_id,
+        message_id: p.message_id,
+        parse_mode: 'Markdown',
+        reply_markup: panel.reply_markup
+      });
+    }
 });
+  
 
 // Step 4: withdraw address
 bot.on('message', async msg=>{
