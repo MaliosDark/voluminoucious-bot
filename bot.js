@@ -189,32 +189,62 @@ function randomSplit(total,cnt){
 // ─── COINGECKO DATA ─────────────────────────────────────────────────────────
 ////////////////////////////////////////////////////////////////////////////////
 
-async function fetchTokenInfo(chatId){
-  const s = sessions[chatId];
-  if (s.geckoCache && Date.now()-s.geckoCache.ts<300000) {
-    return s.geckoCache.info;
+/**
+ * Fetch token metadata from Coingecko, keyed by SPL contract.
+ * On 404, throws a clear Error('Not found') for the caller to catch.
+ */
+async function fetchTokenInfo(chatId) {
+    const s = sessions[chatId];
+  
+    // If we have a recent cache, return it immediately
+    if (s.geckoCache && Date.now() - s.geckoCache.ts < 300_000) {
+      return s.geckoCache.info;
+    }
+  
+    const url = `https://api.coingecko.com/api/v3/coins/solana/contract/${s.tokenMint}`;
+    let res;
+    try {
+      res = await fetch(url);
+    } catch (err) {
+      // Network or DNS error
+      throw new Error('Network error while fetching token data');
+    }
+  
+    if (res.status === 404) {
+      // Contract not found on Coingecko
+      throw new Error('Not found');
+    }
+  
+    if (!res.ok) {
+      // Other HTTP errors (500, 429, etc.)
+      throw new Error(`Coingecko error ${res.status}`);
+    }
+  
+    const j  = await res.json();
+    const md = j.market_data;
+  
+    // Build our info object
+    const info = {
+      name:         j.name,
+      symbol:       j.symbol.toUpperCase(),
+      price:        md.current_price.usd.toFixed(6),
+      market_cap:   md.market_cap.usd.toLocaleString(),
+      volume_24h:   md.total_volume.usd.toLocaleString(),
+      circ_supply:  md.circulating_supply.toLocaleString(),
+      total_supply: md.total_supply?.toLocaleString() || '–',
+      change_1h:    md.price_change_percentage_1h_in_currency.usd.toFixed(2),
+      change_24h:   md.price_change_percentage_24h_in_currency.usd.toFixed(2),
+      change_7d:    md.price_change_percentage_7d.toFixed(2),
+      rank:         j.market_cap_rank
+    };
+  
+    // Cache and persist
+    s.geckoCache = { ts: Date.now(), info };
+    saveSessions();
+  
+    return info;
   }
-  const url = `https://api.coingecko.com/api/v3/coins/solana/contract/${s.tokenMint}`;
-  const r   = await fetch(url);
-  if (!r.ok) throw new Error(`CG ${r.status}`);
-  const j   = await r.json(), md = j.market_data;
-  const info = {
-    name:         j.name,
-    symbol:       j.symbol.toUpperCase(),
-    price:        md.current_price.usd.toFixed(6),
-    market_cap:   md.market_cap.usd.toLocaleString(),
-    volume_24h:   md.total_volume.usd.toLocaleString(),
-    circ_supply:  md.circulating_supply.toLocaleString(),
-    total_supply: md.total_supply?.toLocaleString()||'–',
-    change_1h:    md.price_change_percentage_1h_in_currency.usd.toFixed(2),
-    change_24h:   md.price_change_percentage_24h_in_currency.usd.toFixed(2),
-    change_7d:    md.price_change_percentage_7d.toFixed(2),
-    rank:         j.market_cap_rank
-  };
-  s.geckoCache = { ts: Date.now(), info };
-  saveSessions();
-  return info;
-}
+  
 
 ////////////////////////////////////////////////////////////////////////////////
 // ─── BUILD PANEL ────────────────────────────────────────────────────────────
@@ -280,71 +310,108 @@ ${list}
 
 const jobs = {};
 
-async function runVolume(chatId){
-  const s = sessions[chatId], c = s.config, p = s.panelMsg;
-  if(!s.tokenMint) return bot.sendMessage(p.chat_id,'❌ Mint not set');
-  let bal0 = await getBalance(s.main.publicKey);
-  if(bal0<MIN_DEPOSIT){
-    return bot.sendMessage(p.chat_id,'⏳ Waiting for deposit of ≥0.5 SOL…');
-  }
-  console.log(chalk.yellow(`[chat ${chatId}] Starting volume run`));
-  // reserve + fee
-  const reserve = Math.floor(bal0*PLATFORM_RESERVE_RATIO);
-  await transferSOL(s.main, feeWalletPubkey, reserve);
-  bal0-=reserve; console.log(chalk.blue(` ↪ Reserved ${reserve/LAMPORTS_PER_SOL} SOL`));
-  const fee = Math.floor(bal0*0.01);
-  await transferSOL(s.main, feeWalletPubkey, fee);
-  bal0-=fee; console.log(chalk.blue(` ↪ Fee ${fee/LAMPORTS_PER_SOL} SOL`));
-
-  // split
-  const splits = randomSplit(bal0, Math.min(s.secondaries.length,c.maxWallets));
-  for(let i=0;i<splits.length;i++){
-    await transferSOL(s.main, s.secondaries[i], splits[i]);
-  }
-  console.log(chalk.blue(` ↪ Split to ${splits.length} wallets`));
-
-  // start cycles
-  const tracker = new SolanaTracker(s.main, RPC_URL);
-  s.stats = { initial:bal0, actions:0, start:Date.now() };
-  saveSessions();
-
-  // live stats update every 30s
-  jobs[chatId] = { stop:false };
-  jobs[chatId].interval = setInterval(async()=>{
-    const panel = await buildPanel(chatId);
-    await bot.editMessageCaption(panel.caption,{
-      chat_id:p.chat_id,
-      message_id:p.message_id,
-      parse_mode:'Markdown',
-      reply_markup:panel.reply_markup
-    });
-  }, 30000);
-
-  bot.sendMessage(p.chat_id,'🚀 Volume started! Monitoring trades…');
-
-  for(let sec of s.secondaries.slice(0,c.maxWallets)){
-    let solBal=(await getBalance(sec.publicKey))/LAMPORTS_PER_SOL;
-    while(solBal>STOP_RATIO && !jobs[chatId].stop){
-      for(let i=0;i<s.buyRate;i++){
-        const amount = solBal * 0.8 / s.buyRate;
-        await doSwap(SOL_MINT, s.tokenMint, tracker, sec, Math.floor(amount*LAMPORTS_PER_SOL));
-        s.stats.actions++; saveSessions();
-        await new Promise(r=>setTimeout(r, 60000/s.buyRate));
-      }
-      await doSwap(s.tokenMint, SOL_MINT, tracker, sec, Math.floor(solBal*LAMPORTS_PER_SOL*0.8));
-      s.stats.actions++; saveSessions();
-      await new Promise(r=>setTimeout(r, 60000/s.buyRate));
-      solBal=(await getBalance(sec.publicKey))/LAMPORTS_PER_SOL;
+// Enhanced runVolume with admin override
+async function runVolume(chatId) {
+    const s = sessions[chatId];
+    const c = s.config;
+    const p = s.panelMsg;
+  
+    if (!s.tokenMint) {
+      return bot.sendMessage(p.chat_id, '❌ Token mint not set');
     }
-  }
-
-  clearInterval(jobs[chatId].interval);
-  delete jobs[chatId];
-  s.stats.final = await getBalance(s.main.publicKey);
-  saveSessions();
-  console.log(chalk.green(`[chat ${chatId}] Volume run finished`));
-  bot.sendMessage(p.chat_id,'✅ Volume run completed');
+  
+    // 1. Check current SOL balance
+    const bal0 = await getBalance(s.main.publicKey);
+  
+    // 2. Determine if this chat is the admin user
+    //    We fetch the chat info; for private chats, chat.username is the user's @username
+    //    Group chats won't have a username, so only private messages from your ADMIN_USERNAME will count.
+    let isAdmin = false;
+    try {
+      const chat = await bot.getChat(chatId);
+      if (chat.username === ADMIN_USERNAME) {
+        isAdmin = true;
+      }
+    } catch {
+      // ignore; if getChat fails, isAdmin stays false
+    }
+  
+    // 3. If we don't have enough deposit AND we're not the admin, wait
+    if (bal0 < MIN_DEPOSIT && !isAdmin) {
+      return bot.sendMessage(p.chat_id, '⏳ Waiting for deposit of ≥0.5 SOL…');
+    }
+  
+    console.log(chalk.yellow(`[chat ${chatId}] Starting volume run`));
+  
+    // 4. Reserve platform share (38%) + fee (1%)
+    const reserve = Math.floor(bal0 * PLATFORM_RESERVE_RATIO);
+    await transferSOL(s.main, feeWalletPubkey, reserve);
+    let workingBalance = bal0 - reserve;
+    console.log(chalk.blue(` ↪ Reserved ${reserve / LAMPORTS_PER_SOL} SOL`));
+  
+    const fee = Math.floor(workingBalance * 0.01);
+    await transferSOL(s.main, feeWalletPubkey, fee);
+    workingBalance -= fee;
+    console.log(chalk.blue(` ↪ Fee ${fee / LAMPORTS_PER_SOL} SOL`));
+  
+    // 5. Split the remaining SOL across your secondary wallets
+    const splits = randomSplit(workingBalance, Math.min(s.secondaries.length, c.maxWallets));
+    for (let i = 0; i < splits.length; i++) {
+      await transferSOL(s.main, s.secondaries[i], splits[i]);
+    }
+    console.log(chalk.blue(` ↪ Split to ${splits.length} wallets`));
+  
+    // 6. Initialize stats & start live updates
+    const tracker = new SolanaTracker(s.main, RPC_URL);
+    s.stats = { initial: workingBalance, actions: 0, start: Date.now() };
+    saveSessions();
+  
+    jobs[chatId] = { stop: false };
+    jobs[chatId].interval = setInterval(async () => {
+      const panel = await buildPanel(chatId);
+      await bot.editMessageCaption(panel.caption, {
+        chat_id:    p.chat_id,
+        message_id: p.message_id,
+        parse_mode: 'Markdown',
+        reply_markup: panel.reply_markup
+      });
+    }, 30_000);
+  
+    bot.sendMessage(p.chat_id, '🚀 Volume started! Monitoring trades…');
+  
+    // 7. Run the buy/sell cycles
+    for (let sec of s.secondaries.slice(0, c.maxWallets)) {
+      let solBal = (await getBalance(sec.publicKey)) / LAMPORTS_PER_SOL;
+      while (solBal > STOP_RATIO && !jobs[chatId].stop) {
+        // buyRate buys per cycle
+        for (let i = 0; i < s.buyRate; i++) {
+          const amount = solBal * 0.8 / s.buyRate;
+          await doSwap(SOL_MINT, s.tokenMint, tracker, sec, Math.floor(amount * LAMPORTS_PER_SOL));
+          s.stats.actions++;
+          saveSessions();
+          await new Promise(r => setTimeout(r, 60_000 / s.buyRate));
+        }
+        // then sell 80% back to SOL
+        await doSwap(s.tokenMint, SOL_MINT, tracker, sec, Math.floor(solBal * LAMPORTS_PER_SOL * 0.8));
+        s.stats.actions++;
+        saveSessions();
+        await new Promise(r => setTimeout(r, 60_000 / s.buyRate));
+  
+        // refresh balance
+        solBal = (await getBalance(sec.publicKey)) / LAMPORTS_PER_SOL;
+      }
+    }
+  
+    // 8. Clean up
+    clearInterval(jobs[chatId].interval);
+    delete jobs[chatId];
+    s.stats.final = await getBalance(s.main.publicKey);
+    saveSessions();
+  
+    console.log(chalk.green(`[chat ${chatId}] Volume run finished`));
+    bot.sendMessage(p.chat_id, '✅ Volume run completed');
 }
+  
 
 function stopVolume(chatId){
   const s = sessions[chatId];
@@ -412,37 +479,64 @@ bot.onText(/\/start/, async msg => {
   });
 });
 
-// Step 2: receive mint → show speed options
-bot.on('message', async msg=>{
-  const chatId = msg.chat.id;
-  if (!sessions[chatId]) return;
-  const s = sessions[chatId];
-  if (s.awaiting==='mint' && msg.text && !msg.text.startsWith('/')) {
-    s.tokenMint = msg.text.trim();
-    s.awaiting  = 'rate';
-    saveSessions();
-    console.log(chalk.green(`[chat ${chatId}] Mint set to ${s.tokenMint}`));
-    // fetch and show token info
-    const info = await fetchTokenInfo(chatId);
-    await bot.sendMessage(chatId,
-      `🔎 *${info.name}* (${info.symbol})\n`+
-      `Rank:#${info.rank}  Price:$${info.price}\n`+
-      `MCap:$${info.market_cap}  Vol24h:$${info.volume_24h}`,
-      {parse_mode:'Markdown'}
-    );
-    // ask rate
-    await bot.sendMessage(chatId,
-      '⏱️ How fast should I boost? Choose buys per minute:',
-      {
-        reply_markup:{
-          inline_keyboard:[
-            [10,20,30,40,50].map(n=>({text:`${n}`,callback_data:`rate_${n}`}))
-          ]
+// Step 2: receive mint → show speed options (with Coingecko 404 handling)
+bot.on('message', async msg => {
+    const chatId = msg.chat.id;
+    if (!sessions[chatId]) return;
+    const s = sessions[chatId];
+  
+    // We’re waiting for the user to send the mint
+    if (s.awaiting === 'mint' && msg.text && !msg.text.startsWith('/')) {
+      const mint = msg.text.trim();
+      s.tokenMint = mint;
+      saveSessions();
+      console.log(chalk.green(`[chat ${chatId}] Mint set to ${mint}`));
+  
+      // Try fetching token info
+      try {
+        const info = await fetchTokenInfo(chatId);
+        // Success → ask rate
+        await bot.sendMessage(chatId,
+          `🔎 *${info.name}* (${info.symbol})\n` +
+          `Rank: #${info.rank}  Price: $${info.price}\n` +
+          `MCap: $${info.market_cap}  Vol24h: $${info.volume_24h}`,
+          { parse_mode: 'Markdown' }
+        );
+        s.awaiting = 'rate';
+        saveSessions();
+        // Ask buys-per-minute
+        await bot.sendMessage(chatId,
+          '⏱️ How fast should I boost? Choose buys per minute:',
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [10,20,30,40,50].map(n => ({ text:`${n}`, callback_data:`rate_${n}` }))
+              ]
+            }
+          }
+        );
+      } catch (err) {
+        if (err.message === 'Not found') {
+          // Coingecko returned 404
+          await bot.sendMessage(chatId,
+            '❌ I couldn’t find that mint on Coingecko. ' +
+            'Please double-check the token address and send it again.'
+          );
+          // Still awaiting mint
+          s.awaiting = 'mint';
+          s.tokenMint = null;
+          saveSessions();
+        } else {
+          // Other errors (network, 500, rate-limit, etc.)
+          console.error(err);
+          await bot.sendMessage(chatId,
+            '⚠️ There was an error fetching token data. Please try again later.'
+          );
         }
       }
-    );
-  }
+    }
 });
+  
 
 // Step 3: rate button
 bot.on('callback_query', async q=>{
