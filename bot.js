@@ -152,38 +152,85 @@ async function initSession(chatId) {
 // ─── SOLANA HELPERS ─────────────────────────────────────────────────────────
 ////////////////////////////////////////////////////////////////////////////////
 
-async function getBalance(pub) { return conn.getBalance(pub); }
-async function getTokenBalance(pub,mint){
-  try {
-    const r = await conn.getTokenAccountsByOwner(pub,{mint:new PublicKey(mint)});
-    if (!r.value.length) return 0;
-    return (await conn.getTokenAccountBalance(r.value[0].pubkey)).value.uiAmount;
-  } catch { return 0; }
-}
-async function transferSOL(f,to,lam){
-  return conn.sendTransaction(
-    new Transaction().add(SystemProgram.transfer({
-      fromPubkey:f.publicKey,
-      toPubkey:  to.publicKey,
-      lamports:  lam
-    })), [f], {skipPreflight:true}
-  );
-}
-async function doSwap(inM,outM,tracker,kp,lam){
-  const inst = await tracker.getSwapInstructions(
-    inM,outM,lam,2,kp.publicKey.toBase58(),
-    0.000005*LAMPORTS_PER_SOL,false
-  );
-  const tx = Transaction.from(Buffer.from(inst.txn,'base64'));
-  tx.sign(kp);
-  const sig = await conn.sendTransaction(tx,[kp],{skipPreflight:true});
-  await conn.confirmTransaction(sig,'confirmed');
-}
-function randomSplit(total,cnt){
-  const w = Array.from({length:cnt},()=>crypto.randomInt(1,100));
-  const s = w.reduce((a,b)=>a+b,0);
-  return w.map(x=>Math.floor(total*x/s));
-}
+/**
+ * Get the SOL balance of a public key.
+ */
+async function getBalance(pub) {
+    return conn.getBalance(pub);
+  }
+  
+  /**
+   * Get the SPL token balance (UI amount) of a mint for a given owner.
+   */
+  async function getTokenBalance(pub, mint) {
+    try {
+      const res = await conn.getTokenAccountsByOwner(pub, { mint: new PublicKey(mint) });
+      if (!res.value.length) return 0;
+      const info = await conn.getTokenAccountBalance(res.value[0].pubkey);
+      return info.value.uiAmount;
+    } catch {
+      return 0;
+    }
+  }
+  
+  /**
+   * Transfer raw SOL from one keypair to another.
+   */
+  async function transferSOL(fromKeypair, toPubkey, lamports) {
+    const tx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: fromKeypair.publicKey,
+        toPubkey:   toPubkey.publicKey ? toPubkey.publicKey : toPubkey,
+        lamports:   lamports
+      })
+    );
+    return conn.sendTransaction(tx, [fromKeypair], { skipPreflight: true });
+  }
+  
+  /**
+   * Execute a Solana swap via SolanaTracker, ensuring feePayer and blockhash are set.
+   */
+  async function doSwap(inMint, outMint, tracker, signerKeypair, lamports) {
+    // 1. Get the base64-encoded swap transaction from the tracker
+    const inst = await tracker.getSwapInstructions(
+      inMint,
+      outMint,
+      lamports,
+      2,
+      signerKeypair.publicKey.toBase58(),
+      0.000005 * LAMPORTS_PER_SOL,
+      false
+    );
+  
+    // 2. Deserialize the transaction
+    const tx = Transaction.from(Buffer.from(inst.txn, 'base64'));
+  
+    // 3. Set feePayer
+    tx.feePayer = signerKeypair.publicKey;
+  
+    // 4. Fetch and set a recent blockhash
+    const { blockhash } = await conn.getRecentBlockhash('confirmed');
+    tx.recentBlockhash = blockhash;
+  
+    // 5. Sign with the provided keypair
+    tx.sign(signerKeypair);
+  
+    // 6. Send the raw, fully formed transaction
+    const signature = await conn.sendRawTransaction(tx.serialize(), {
+      skipPreflight: true
+    });
+    await conn.confirmTransaction(signature, 'confirmed');
+  }
+  
+  /**
+   * Randomly split a total number into `count` integer pieces.
+   */
+  function randomSplit(total, count) {
+    const weights = Array.from({ length: count }, () => crypto.randomInt(1, 100));
+    const sum = weights.reduce((a, b) => a + b, 0);
+    return weights.map(w => Math.floor((total * w) / sum));
+  }
+  
 
 ////////////////////////////////////////////////////////////////////////////////
 // ─── COINGECKO DATA ─────────────────────────────────────────────────────────
