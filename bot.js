@@ -189,61 +189,84 @@ function randomSplit(total,cnt){
 // ─── COINGECKO DATA ─────────────────────────────────────────────────────────
 ////////////////////////////////////////////////////////////////////////////////
 
+// ─── COINGECKO DATA (with on-chain fallback) ────────────────────────────────
+
 /**
- * Fetch token metadata from Coingecko, keyed by SPL contract.
- * On 404, throws a clear Error('Not found') for the caller to catch.
+ * Fetch token metadata from Coingecko; on 404 fall back to on-chain check.
+ * If on-chain supply > 0, we consider it valid but return minimal info.
  */
 async function fetchTokenInfo(chatId) {
     const s = sessions[chatId];
-  
-    // If we have a recent cache, return it immediately
+    // 1) return cache if fresh
     if (s.geckoCache && Date.now() - s.geckoCache.ts < 300_000) {
       return s.geckoCache.info;
     }
   
+    // 2) try Coingecko
     const url = `https://api.coingecko.com/api/v3/coins/solana/contract/${s.tokenMint}`;
     let res;
     try {
       res = await fetch(url);
     } catch (err) {
-      // Network or DNS error
       throw new Error('Network error while fetching token data');
     }
-  
     if (res.status === 404) {
-      // Contract not found on Coingecko
-      throw new Error('Not found');
+      // fallback: on-chain
+      try {
+        const supplyInfo = await conn.getTokenSupply(new PublicKey(s.tokenMint));
+        if (supplyInfo.value.amount !== '0') {
+          // token exists on chain—return minimal info
+          const info = {
+            name:  s.tokenMint,
+            symbol: s.tokenMint.slice(0,6).toUpperCase(),
+            price: '–',
+            market_cap: '–',
+            volume_24h: '–',
+            circ_supply: supplyInfo.value.amount,
+            total_supply: supplyInfo.value.amount,
+            change_1h: '–',
+            change_24h: '–',
+            change_7d: '–',
+            rank: '–'
+          };
+          // cache minimal
+          s.geckoCache = { ts: Date.now(), info };
+          saveSessions();
+          return info;
+        } else {
+          throw new Error('Not found');
+        }
+      } catch {
+        throw new Error('Not found');
+      }
     }
-  
     if (!res.ok) {
-      // Other HTTP errors (500, 429, etc.)
       throw new Error(`Coingecko error ${res.status}`);
     }
   
+    // 3) parse Coingecko result
     const j  = await res.json();
     const md = j.market_data;
-  
-    // Build our info object
     const info = {
-      name:         j.name,
-      symbol:       j.symbol.toUpperCase(),
-      price:        md.current_price.usd.toFixed(6),
-      market_cap:   md.market_cap.usd.toLocaleString(),
-      volume_24h:   md.total_volume.usd.toLocaleString(),
-      circ_supply:  md.circulating_supply.toLocaleString(),
+      name:        j.name,
+      symbol:      j.symbol.toUpperCase(),
+      price:       md.current_price.usd.toFixed(6),
+      market_cap:  md.market_cap.usd.toLocaleString(),
+      volume_24h:  md.total_volume.usd.toLocaleString(),
+      circ_supply: md.circulating_supply.toLocaleString(),
       total_supply: md.total_supply?.toLocaleString() || '–',
-      change_1h:    md.price_change_percentage_1h_in_currency.usd.toFixed(2),
-      change_24h:   md.price_change_percentage_24h_in_currency.usd.toFixed(2),
-      change_7d:    md.price_change_percentage_7d.toFixed(2),
-      rank:         j.market_cap_rank
+      change_1h:   md.price_change_percentage_1h_in_currency.usd.toFixed(2),
+      change_24h:  md.price_change_percentage_24h_in_currency.usd.toFixed(2),
+      change_7d:   md.price_change_percentage_7d.toFixed(2),
+      rank:        j.market_cap_rank
     };
   
-    // Cache and persist
+    // 4) cache & return
     s.geckoCache = { ts: Date.now(), info };
     saveSessions();
-  
     return info;
-  }
+}
+  
   
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -479,58 +502,73 @@ bot.onText(/\/start/, async msg => {
   });
 });
 
-// Step 2: receive mint → show speed options (with Coingecko 404 handling)
+// ─── Step 2: receive mint → show speed options (with multi-API fallback) ────
+
 bot.on('message', async msg => {
     const chatId = msg.chat.id;
     if (!sessions[chatId]) return;
     const s = sessions[chatId];
   
-    // We’re waiting for the user to send the mint
     if (s.awaiting === 'mint' && msg.text && !msg.text.startsWith('/')) {
       const mint = msg.text.trim();
       s.tokenMint = mint;
       saveSessions();
       console.log(chalk.green(`[chat ${chatId}] Mint set to ${mint}`));
   
-      // Try fetching token info
       try {
         const info = await fetchTokenInfo(chatId);
-        // Success → ask rate
-        await bot.sendMessage(chatId,
-          `🔎 *${info.name}* (${info.symbol})\n` +
-          `Rank: #${info.rank}  Price: $${info.price}\n` +
-          `MCap: $${info.market_cap}  Vol24h: $${info.volume_24h}`,
-          { parse_mode: 'Markdown' }
-        );
+        // If price is “–” we know it came from on-chain fallback
+        const header =
+          info.price === '–'
+            ? `✅ Token found on-chain (no Coingecko data yet)`
+            : `🔎 *${info.name}* (${info.symbol})\n` +
+              `Rank: #${info.rank}  Price: $${info.price}\n` +
+              `MCap: $${info.market_cap}  Vol24h: $${info.volume_24h}`;
+  
+        await bot.sendMessage(chatId, header, { parse_mode:'Markdown' });
+  
+        // proceed to rate selection
         s.awaiting = 'rate';
         saveSessions();
-        // Ask buys-per-minute
         await bot.sendMessage(chatId,
           '⏱️ How fast should I boost? Choose buys per minute:',
           {
-            reply_markup: {
-              inline_keyboard: [
-                [10,20,30,40,50].map(n => ({ text:`${n}`, callback_data:`rate_${n}` }))
+            reply_markup:{
+              inline_keyboard:[
+                [10,20,30,40,50].map(n=>({ text:`${n}`, callback_data:`rate_${n}` }))
               ]
             }
           }
         );
+  
       } catch (err) {
         if (err.message === 'Not found') {
-          // Coingecko returned 404
           await bot.sendMessage(chatId,
-            '❌ I couldn’t find that mint on Coingecko. ' +
+            '❌ I couldn’t verify that mint on Coingecko or on-chain. ' +
             'Please double-check the token address and send it again.'
           );
-          // Still awaiting mint
-          s.awaiting = 'mint';
+          // remain in ‘mint’ state
           s.tokenMint = null;
+          s.awaiting = 'mint';
           saveSessions();
         } else {
-          // Other errors (network, 500, rate-limit, etc.)
           console.error(err);
           await bot.sendMessage(chatId,
-            '⚠️ There was an error fetching token data. Please try again later.'
+            '⚠️ Unable to fetch token data right now. ' +
+            'You can still use this mint, but data may be incomplete.'
+          );
+          // proceed anyway
+          s.awaiting = 'rate';
+          saveSessions();
+          await bot.sendMessage(chatId,
+            '⏱️ How fast should I boost? Choose buys per minute:',
+            {
+              reply_markup:{
+                inline_keyboard:[
+                  [10,20,30,40,50].map(n=>({ text:`${n}`, callback_data:`rate_${n}` }))
+                ]
+              }
+            }
           );
         }
       }
